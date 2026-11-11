@@ -1,25 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Freeze question-bank families and materialize explicitly reviewed Gym rows.
+"""Materialize question-bank evaluation rows using shared math and semantic routes.
 
-Run from the repository root with ``python -m resources_servers.stem_judge.prepare``.
-No candidate answers or historical verdicts are read into the preparation logic.
-Without --contracts this produces a complete unresolved ledger and empty Gym files.
-The output is an engineering preparation artifact, never training admission evidence.
+The selected dataset and a version-bound triage inventory supply routing metadata;
+no per-question grading contract is required. Rubric/construction and native-test
+rows remain in the ledger but are excluded from the text-grading export.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import hashlib
 import json
-import math
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from resources_servers.stem_judge.prompts import (
+    POLICY_PROMPT_REVISION,
+    build_policy_prompt,
+    validate_prompt_overrides,
+)
 
-ADAPTER_REVISION = "question-bank-contract-v1"
+
+ADAPTER_REVISION = "question-bank-shared-routes-v2"
 SPLIT_SEED = "stem-judge-family-split-v1"
 DOMAIN_ALIASES = {"phys": "physics", "bio": "biology", "chem": "chemistry / materials"}
 
@@ -103,54 +108,66 @@ def family_splits(rows: list[dict], *, development_ids: set[str], seed: str = SP
     return result
 
 
-def _load_contracts(path: Path | None) -> dict[tuple[str, str], dict]:
-    if path is None:
-        return {}
-    # The ledger-only path is standard-library-only. Reviewed contracts use the
-    # exact server schema, avoiding a second permissive schema implementation.
-    from resources_servers.stem_judge.contracts import TaskContract
+TRIAGE_GROUPS = {
+    "answer_comparison_review",
+    "construction_or_rubric_review",
+    "competitive_coding_native",
+    "scientific_coding_native",
+    "noncoding_native_tests_unresolved",
+}
+NATIVE_GROUPS = TRIAGE_GROUPS - {"answer_comparison_review", "construction_or_rubric_review"}
 
-    result = {}
+
+def _load_inventory(path: Path, rows: list[dict], hashes: list[str]) -> dict[str, dict[str, str]]:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", newline="") as handle:
+        records = list(csv.DictReader(handle))
+    inventory = {}
+    for item in records:
+        task_id = _text(item, "id")
+        if task_id in inventory:
+            raise ValueError(f"duplicate inventory task ID: {task_id}")
+        if item.get("review_group") not in TRIAGE_GROUPS:
+            raise ValueError(f"unsupported triage group: {item.get('review_group')}")
+        inventory[task_id] = item
+    if set(inventory) != {row["id"] for row in rows}:
+        raise ValueError("inventory membership must exactly match the selected dataset")
+    for line_no, (row, digest) in enumerate(zip(rows, hashes, strict=True), start=1):
+        item = inventory[row["id"]]
+        for field in ("version_sha256", "version"):
+            if item.get(field) != row[field]:
+                raise ValueError(f"inventory {field} mismatch for {row['id']}")
+        domain = DOMAIN_ALIASES.get(row["domain"].casefold(), row["domain"].casefold())
+        inventory_domain = item.get("domain", "").casefold()
+        if DOMAIN_ALIASES.get(inventory_domain, inventory_domain) != domain:
+            raise ValueError(f"inventory domain mismatch for {row['id']}")
+        if item.get("source_row_sha256") != digest or item.get("dataset_line") != str(line_no):
+            raise ValueError(f"inventory source row binding mismatch for {row['id']}")
+    return inventory
+
+
+def _check_frozen_families(path: Path, splits: dict[str, dict]) -> None:
+    frozen = {}
     for line in path.read_text().splitlines():
-        entry = _object(json.loads(line))
-        if "contract" in entry:
-            if set(entry) - {"contract", "rubric"}:
-                raise ValueError("reviewed entries allow only contract and rubric")
-            contract = TaskContract.model_validate(entry["contract"])
-            rubric = entry.get("rubric")
-        else:
-            contract = TaskContract.model_validate(entry)
-            rubric = None
-        if rubric is not None:
-            if contract.task_type != "rubric" or not isinstance(rubric, list) or not rubric:
-                raise ValueError("rubric criteria require a rubric contract and nonempty list")
-            ids = set()
-            positive_ids = set()
-            absolute_total = 0.0
-            for criterion in rubric:
-                criterion = _object(criterion)
-                if set(criterion) != {"id", "criterion", "points"}:
-                    raise ValueError("rubric criterion keys must be id, criterion, points")
-                identifier = _text(criterion, "id")
-                _text(criterion, "criterion")
-                points = criterion["points"]
-                if isinstance(points, bool) or not isinstance(points, (float, int)):
-                    raise ValueError("rubric points must be numeric")
-                if not math.isfinite(points) or points == 0 or identifier in ids:
-                    raise ValueError("rubric points must be finite and nonzero; IDs must be unique")
-                ids.add(identifier)
-                absolute_total += abs(points)
-                if points > 0:
-                    positive_ids.add(identifier)
-            if not math.isfinite(absolute_total):
-                raise ValueError("rubric absolute point total must be finite")
-            if not positive_ids or not set(contract.mandatory_criteria).issubset(positive_ids):
-                raise ValueError("rubric must have positive points and every mandatory criterion must be positive")
-        key = (contract.task_id, contract.task_version)
-        if key in result:
-            raise ValueError(f"duplicate reviewed contract: {key}")
-        result[key] = {"contract": contract.model_dump(mode="json"), "rubric": rubric}
-    return result
+        family = _object(json.loads(line))
+        for task_id in family["task_ids"]:
+            if task_id in frozen:
+                raise ValueError("frozen family manifest contains duplicate tasks")
+            frozen[task_id] = {key: family[key] for key in ("family_id", "split", "forced_development")}
+    if frozen != splits:
+        raise ValueError("computed families differ from the frozen split manifest")
+
+
+def _selected_reference_state(row: dict) -> str | None:
+    answer = row.get("expected_answer")
+    if not isinstance(answer, str) or not answer.strip():
+        return "excluded_missing_reference"
+    reference = _object(row.get("reference") or {})
+    if reference.get("expected_answer") is not None and reference["expected_answer"] != answer:
+        return "excluded_reference_mismatch"
+    if reference.get("expected_answer_sha256") and reference["expected_answer_sha256"] != _hash(answer):
+        return "excluded_reference_mismatch"
+    return None
 
 
 def prepare(
@@ -158,13 +175,15 @@ def prepare(
     output_dir: Path,
     *,
     development_ids: set[str],
-    contracts_path: Path | None = None,
+    inventory_path: Path,
+    prompt_overrides_path: Path | None = None,
+    frozen_families_path: Path | None = None,
     seed: str = SPLIT_SEED,
 ) -> dict:
-    """Write a new ledger, family manifest, coverage receipt and separated Gym rows.
+    """Write immutable evaluation data, complete routing ledger and coverage receipt.
 
-    Existing output directories are refused. Contract-ready means schema/reference
-    checks passed; every row remains ``training_admitted: false`` until live validation.
+    The inventory binds triage decisions to selected source bytes. Emitted rows are
+    candidates for evaluation, not proof of grading accuracy or training admission.
     """
     if output_dir.exists():
         raise FileExistsError(output_dir)
@@ -185,13 +204,15 @@ def prepare(
         raise ValueError("dataset contains duplicate task IDs")
     if development_ids - ids:
         raise ValueError(f"development IDs absent from dataset: {sorted(development_ids - ids)}")
-    contracts = _load_contracts(contracts_path)
-    unknown = contracts.keys() - {(r["id"], r["version_sha256"]) for r in rows}
-    if unknown:
-        raise ValueError(f"reviewed contracts do not match selected task versions: {sorted(unknown)}")
+    inventory = _load_inventory(inventory_path, rows, hashes)
+    overrides = validate_prompt_overrides(
+        json.loads(prompt_overrides_path.read_text()) if prompt_overrides_path else {}
+    )
     splits = family_splits(rows, development_ids=development_ids, seed=seed)
+    if frozen_families_path:
+        _check_frozen_families(frozen_families_path, splits)
     output_dir.mkdir(parents=True, exist_ok=False)
-    counts = Counter()
+    counts, route_counts, split_counts = Counter(), Counter(), Counter()
     coverage = defaultdict(Counter)
     artifact_names = ["ledger.jsonl", "families.jsonl", "development.gym.jsonl", "heldout.gym.jsonl", "coverage.json"]
     with (
@@ -203,74 +224,85 @@ def prepare(
             repaired = row["version"] == "deepseek_repaired"
             reference = row.get("expected_answer")
             reference_hash = _hash(reference) if isinstance(reference, str) else None
-            review = contracts.get((row["id"], row["version_sha256"]))
-            contract = review["contract"] if review else None
+            triage = inventory[row["id"]]
+            domain = DOMAIN_ALIASES.get(row["domain"].casefold(), row["domain"].casefold())
+            source = (row.get("upstream") or {}).get("dataset") or triage.get("upstream_dataset") or "unknown"
+            if not isinstance(source, str):
+                raise ValueError("upstream source name must be a string")
             kind = _object(row.get("reference") or {}).get("kind")
-            state = "needs_contract"
-            if kind in {"tests_only", "native_grader"} or (contract and contract["task_type"] == "native"):
-                state = "native_assets_unavailable"
-            elif contract:
-                source_domain = DOMAIN_ALIASES.get(row["domain"].casefold(), row["domain"].casefold())
-                contract_domain = DOMAIN_ALIASES.get(contract["domain"].casefold(), contract["domain"].casefold())
-                if contract["repaired"] != repaired:
-                    state = "repair_version_mismatch"
-                elif contract["policy_input_revision"] != "original":
-                    state = "unsupported_policy_input_revision"
-                elif contract_domain not in {"unspecified", source_domain}:
-                    state = "domain_mismatch"
-                elif repaired and not contract["assets_verified"]:
-                    state = "repaired_assets_unverified"
-                elif contract["reference_sha256"] != reference_hash or reference_hash is None:
-                    state = "reference_hash_mismatch"
-                elif not reference.strip():
-                    state = "missing_reference"
-                elif contract["task_type"] == "rubric" and not review["rubric"]:
-                    state = "missing_rubric"
-                else:
-                    state = "contract_ready"
+            methods = set(triage.get("declared_methods", "").split("|"))
+            route = None
+            if triage["review_group"] in NATIVE_GROUPS or kind in {"tests_only", "native_grader"}:
+                state = "excluded_native_pending_runner"
+            elif "NATIVE_CODE_TESTS" in methods:
+                state = "excluded_native_pending_runner"
+            elif triage["review_group"] == "construction_or_rubric_review" or methods.intersection(
+                {"RUBRIC_ASSESSMENT", "CONSTRUCTION_VALIDATION"}
+            ):
+                state = "excluded_rubric"
+            else:
+                state = _selected_reference_state(row) or "evaluation_candidate"
+                if state == "evaluation_candidate":
+                    route = "math" if domain == "mathematics" else "semantic"
             lineage = {
                 key: row.get(key)
                 for key in ("original_question_sha256", "qa_variant_ids", "source_memberships", "upstream")
             }
-            item = {
-                "task_id": row["id"],
+            extra_instructions = [
+                overrides[group][key]
+                for group, key in (("domains", domain), ("sources", source))
+                if key in overrides[group]
+            ]
+            metadata = {
                 "task_version": row["version_sha256"],
                 "version": row["version"],
-                "domain": row["domain"],
+                "domain": domain,
+                "source": source,
                 "repaired": repaired,
-                "dataset_line": line_no,
                 "source_row_sha256": source_hash,
-                "problem_sha256": _hash(row["problem"]),
                 "reference_sha256": reference_hash,
+                "problem_sha256": _hash(row["problem"]),
+                "policy_input_revision": POLICY_PROMPT_REVISION,
+                "policy_overrides_applied": bool(extra_instructions),
+                "policy_extra_instructions": extra_instructions,
+                "adapter_revision": ADAPTER_REVISION,
+                "review_group": triage["review_group"],
+                "declared_methods": sorted(methods - {""}),
                 "reference_kind": kind,
                 "lineage": lineage,
                 **splits[row["id"]],
-                "adapter_revision": ADAPTER_REVISION,
-                "contract_sha256": _hash(_json(review)) if review else None,
-                "task_contract": contract,
+            }
+            item = {
+                "task_id": row["id"],
+                **metadata,
+                "dataset_line": line_no,
+                "original_domain": row["domain"],
+                "route": route,
                 "state": state,
                 "training_admitted": False,
-                "unresolved_reason": None if state == "contract_ready" else state,
+                "unresolved_reason": None if state == "evaluation_candidate" else state,
             }
-            ledger.write(_json(item) + "\n")
             counts[state] += 1
-            group = (row["domain"], "repaired" if repaired else "KEEP")
+            group = (domain, "repaired" if repaired else "KEEP")
             coverage[group]["selected"] += 1
             coverage[group][state] += 1
-            if state == "contract_ready":
+            if route:
+                policy_prompt = build_policy_prompt(row["problem"], domain=domain, source=source, overrides=overrides)
+                item["policy_input_sha256"] = metadata["policy_input_sha256"] = _hash(policy_prompt)
+                route_counts[route] += 1
+                split_counts[item["split"]] += 1
                 gym_row = {
                     "id": row["id"],
                     "uuid": row["id"],
-                    "agent_ref": {"type": "responses_api_agents", "name": "stem_contract_simple_agent"},
-                    "responses_create_params": {"input": [{"role": "user", "content": row["problem"]}]},
+                    "agent_ref": {"type": "responses_api_agents", "name": f"question_bank_{route}_simple_agent"},
+                    "responses_create_params": {"input": [{"role": "user", "content": policy_prompt}]},
+                    "question": row["problem"],
                     "expected_answer": reference,
-                    "task_contract": contract,
-                    "metadata": {"lineage": lineage, "source_row_sha256": source_hash, **splits[row["id"]]},
+                    "metadata": metadata,
                 }
-                if review["rubric"]:
-                    gym_row["rubric"] = review["rubric"]
                 destination = heldout if item["split"] == "heldout" else development
                 destination.write(_json(gym_row) + "\n")
+            ledger.write(_json(item) + "\n")
     families = defaultdict(list)
     for task_id, split in splits.items():
         families[split["family_id"]].append(task_id)
@@ -284,20 +316,28 @@ def prepare(
     (output_dir / "coverage.json").write_text(_json(coverage_rows) + "\n")
     receipt = {
         "adapter_revision": ADAPTER_REVISION,
+        "policy_input_revision": POLICY_PROMPT_REVISION,
         "dataset_path": str(dataset.resolve()),
         "compressed_sha256": _file_hash(dataset),
         "uncompressed_sha256": plain_hash.hexdigest(),
+        "inventory_sha256": _file_hash(inventory_path),
+        "prompt_overrides": overrides,
+        "prompt_overrides_sha256": _file_hash(prompt_overrides_path) if prompt_overrides_path else None,
+        "frozen_families_sha256": _file_hash(frozen_families_path) if frozen_families_path else None,
         "rows": len(rows),
         "families": len(families),
         "split_seed": seed,
         "forced_development_ids": sorted(development_ids),
-        "contracts_sha256": _file_hash(contracts_path) if contracts_path else None,
         "counts": dict(counts),
+        "route_counts": dict(route_counts),
+        "candidate_split_counts": dict(split_counts),
         "training_admitted": 0,
         "limitations": [
             "Recorded lineage grouping cannot detect unidentified semantic duplicates.",
-            "Contract-ready is not accuracy validation, runner validation, or training admission.",
-            "Heldout candidate answers were not used by this preparation step.",
+            "Evaluation-candidate export is not grading accuracy or NeMoRL integration validation.",
+            "Repaired question/reference identity is preserved; references were not independently re-adjudicated.",
+            "Historical answer replay must use the policy input actually received, not these revised generation prompts.",
+            "Native-test declarations remain excluded until actual runners and assets are verified.",
         ],
         "artifacts_sha256": {name: _file_hash(output_dir / name) for name in artifact_names},
     }
@@ -310,8 +350,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--inventory", type=Path, required=True, help="CSV[.gz] triage inventory bound to source rows")
     parser.add_argument("--development-ids", type=Path, required=True, help="JSON list of known development task IDs")
-    parser.add_argument("--contracts", type=Path, help="JSONL of TaskContract or {contract, rubric} reviewed records")
+    parser.add_argument("--prompt-overrides", type=Path, help="JSON domains/sources maps of shared extra instructions")
+    parser.add_argument(
+        "--frozen-families", type=Path, help="Earlier families.jsonl; fail if computed membership differs"
+    )
     parser.add_argument("--split-seed", default=SPLIT_SEED)
     args = parser.parse_args()
     development_ids = json.loads(args.development_ids.read_text())
@@ -321,10 +365,12 @@ def main() -> None:
         args.dataset,
         args.output_dir,
         development_ids=set(development_ids),
-        contracts_path=args.contracts,
+        inventory_path=args.inventory,
+        prompt_overrides_path=args.prompt_overrides,
+        frozen_families_path=args.frozen_families,
         seed=args.split_seed,
     )
-    print(json.dumps({key: receipt[key] for key in ("rows", "families", "counts", "training_admitted")}, indent=2))
+    print(json.dumps({key: receipt[key] for key in ("rows", "families", "counts", "route_counts")}, indent=2))
 
 
 if __name__ == "__main__":

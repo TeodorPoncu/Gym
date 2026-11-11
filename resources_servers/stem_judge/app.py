@@ -1,5 +1,8 @@
 """stem_judge resources server.
 
+Shared ``math`` and ``semantic`` profiles grade ordinary question/reference rows
+without per-row grading specifications, always selecting the last boxed answer.
+The math profile reuses math_with_judge's bounded Math-Verify implementation.
 Rows with ``task_contract`` (or ``require_task_contract`` configured) use strict
 structured verdicts and explicit unresolved outcomes. The contract path checks
 completion, binds provenance, and separates rubric credit from binary success.
@@ -90,6 +93,7 @@ from nemo_gym.verification import (
     judge_failsafe,
     record_parsed_judge_verdict,
 )
+from resources_servers.math_with_judge.answer_extraction import extract_last_boxed_answer
 from resources_servers.stem_judge.contracts import TaskContract, deterministic_check, hash_text, parse_judgment
 
 
@@ -132,6 +136,13 @@ class StemJudgeConfig(BaseResourcesServerConfig):
 
     # Contract grading is opt-in; the original prompt/parser remain reproducible.
     require_task_contract: bool = False
+    # Shared profiles need only question/reference data, never per-row contracts.
+    grading_profile: Optional[Literal["math", "semantic"]] = None
+    library_verifier_timeout_seconds: float = Field(default=10.0, gt=0, allow_inf_nan=False)
+    library_verifier_max_concurrency: int = Field(default=8, gt=0)
+    judge_domain_instructions: dict[str, str] = Field(default_factory=dict)
+    judge_source_instructions: dict[str, str] = Field(default_factory=dict)
+    shared_prompt_template_fpath: str = str(Path(__file__).parent / "prompt_templates/shared_answer_v1.txt")
     judge_model_revision: Optional[str] = None
     judge_timeout_seconds: float = Field(default=300.0, gt=0, le=300, allow_inf_nan=False)
     judge_max_attempts: int = Field(default=2, ge=1, le=2)
@@ -181,6 +192,7 @@ class StemJudgeRunRequest(BaseRunRequest):
 
     task_contract: Optional[TaskContract] = None
     uuid: Optional[str | int] = None
+    question: Optional[str] = None
     expected_answer: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
     answer_format: Optional[Literal["boxed", "free"]] = None
@@ -412,6 +424,19 @@ class StemJudgeResourcesServer(SimpleResourcesServer):
             self._rubric_template = f.read().strip()
         with open(self.config.contract_prompt_template_fpath) as f:
             self._contract_template = f.read().strip()
+        with open(self.config.shared_prompt_template_fpath) as f:
+            self._shared_template = f.read().strip()
+        self._math_library = None
+        if self.config.grading_profile == "math":
+            from resources_servers.stem_judge.math_verifier import MathLibraryVerifier
+
+            self._math_library = MathLibraryVerifier(
+                server_client=self.server_client,
+                judge_model_server=self.config.judge_model_server,
+                judge_responses_create_params=self.config.judge_responses_create_params,
+                timeout_seconds=self.config.library_verifier_timeout_seconds,
+                max_concurrency=self.config.library_verifier_max_concurrency,
+            )
 
         # The pid suffix keeps server replicas from sharing one file; appends within
         # one process are serialized by the event loop (no await between open and close).
@@ -432,8 +457,8 @@ class StemJudgeResourcesServer(SimpleResourcesServer):
         return PROBLEM_EXTRACT_REGEX if self.config.extract_problem_from_prompt else None
 
     async def verify(self, body: StemJudgeVerifyRequest) -> StemJudgeVerifyResponse:
-        if body.task_contract is not None or self.config.require_task_contract:
-            return await self._verify_contract(body)
+        if self.config.grading_profile or body.task_contract is not None or self.config.require_task_contract:
+            return await self._verify_structured(body)
         cfg = self.config
         expected = str(body.expected_answer or (body.metadata or {}).get("expected_answer") or "")
         answer_format = body.answer_format or cfg.default_answer_format
@@ -463,17 +488,20 @@ class StemJudgeResourcesServer(SimpleResourcesServer):
             return await self._grade_rubric(body, expected, answer_format, question, solution)
         return await self._grade_answer(body, expected, answer_format, question, solution)
 
-    async def _verify_contract(self, body: StemJudgeVerifyRequest) -> StemJudgeVerifyResponse:
+    async def _verify_structured(self, body: StemJudgeVerifyRequest) -> StemJudgeVerifyResponse:
         """Grade only declared obligations, preserving unusable measurements as unresolved."""
         started = time.monotonic()
         cfg, contract = self.config, body.task_contract
+        profile = cfg.grading_profile
+        metadata = body.metadata or {}
         expected = body.expected_answer or ""
         raw_final = _assistant_text(body.response)
         final = raw_final.strip()
-        answer_format = contract.answer_format if contract else "free"
+        answer_format = "boxed" if profile else (contract.answer_format if contract else "free")
         evaluations: list[JudgeEvaluation] = []
         provenance: dict[str, Any] = {
-            "verifier_revision": "stem-contract-v1",
+            "verifier_revision": "stem-shared-v2" if profile else "stem-contract-v1",
+            "grading_profile": profile,
             "grading_config_sha256": hash_text(cfg.model_dump_json()),
             "contract_sha256": hash_text(contract.model_dump_json()) if contract else None,
             "rubric_sha256": hash_text(
@@ -565,23 +593,39 @@ class StemJudgeResourcesServer(SimpleResourcesServer):
             response = await failed(body)
             return finish("unresolved", reason, evidence=str(error), failure_fields=json.loads(response.body))
 
-        if contract is None:
+        if profile and (contract is not None or body.rubric):
+            return finish("unresolved", "unsupported_shared_grading_task")
+        if profile:
+            methods = metadata.get("declared_methods") or []
+            if isinstance(methods, str):
+                methods = re.split(r"[|,;\s]+", methods)
+            if (
+                metadata.get("review_group") not in (None, "answer_comparison_review")
+                or metadata.get("reference_kind") in {"tests_only", "native_grader"}
+                or any(
+                    method in {"NATIVE_CODE_TESTS", "RUBRIC_ASSESSMENT", "CONSTRUCTION_VALIDATION"}
+                    for method in methods
+                )
+            ):
+                return finish("unresolved", "unsupported_shared_grading_task")
+        if contract is None and not profile:
             return finish("unresolved", "missing_task_contract")
-        if body.uuid is not None and str(body.uuid) != contract.task_id:
+        if contract and body.uuid is not None and str(body.uuid) != contract.task_id:
             return finish("unresolved", "task_id_mismatch")
-        if body.answer_format is not None and body.answer_format != contract.answer_format:
+        if body.answer_format is not None and body.answer_format != answer_format:
             return finish("unresolved", "conflicting_answer_format")
-        if contract.task_type == "native":
+        if contract and contract.task_type == "native":
             return finish("unresolved", "native_runner_unavailable")
-        if contract.repaired and (not contract.assets_verified or not contract.reference_sha256):
+        if contract and contract.repaired and (not contract.assets_verified or not contract.reference_sha256):
             return finish("unresolved", "repaired_assets_unverified")
-        if contract.task_type == "answer" and not expected.strip():
+        if (profile or contract.task_type == "answer") and not expected.strip():
             return finish("unresolved", "missing_reference")
-        if contract.task_type == "answer" and contract.reference_sha256 is None:
+        if contract and contract.task_type == "answer" and contract.reference_sha256 is None:
             return finish("unresolved", "missing_reference_hash")
-        if contract.reference_sha256 is not None and contract.reference_sha256 != hash_text(expected):
+        reference_hash = (body.metadata or {}).get("reference_sha256") if profile else contract.reference_sha256
+        if reference_hash is not None and reference_hash != hash_text(expected):
             return finish("unresolved", "reference_hash_mismatch")
-        if (contract.task_type == "rubric") != bool(body.rubric):
+        if contract and (contract.task_type == "rubric") != bool(body.rubric):
             return finish("unresolved", "rubric_contract_mismatch")
         if body.rubric:
             positive_ids = {c.id for c in body.rubric if c.points > 0}
@@ -605,8 +649,13 @@ class StemJudgeResourcesServer(SimpleResourcesServer):
             else:
                 return finish("unresolved", "unsupported_question_content")
         provenance["question_sha256"] = hash_text(question)
-        if not question:
+        if profile and body.question is not None:
+            question = body.question
+            provenance["question_sha256"] = hash_text(question)
+        if not question.strip():
             return finish("unresolved", "missing_question")
+        if profile and metadata.get("problem_sha256") not in (None, hash_text(question)):
+            return finish("unresolved", "question_hash_mismatch")
         if _is_length_truncated(body.response):
             return finish("incorrect", "policy_truncated")
         if not _response_completed(body.response):
@@ -615,32 +664,57 @@ class StemJudgeResourcesServer(SimpleResourcesServer):
             return finish("incorrect", "empty_final_answer")
         solution = final
         if answer_format == "boxed":
-            box = last_boxed(final)
+            box = extract_last_boxed_answer(final) if profile else last_boxed(final)
             if box is None:
                 return finish("incorrect", "no_boxed")
             if cfg.max_box_chars is not None and len(box) > cfg.max_box_chars:
                 return finish("unresolved", "box_exceeds_grading_limit")
             # Required work must remain visible even when the final value is boxed.
-            if cfg.boxed_judge_input == "box" and not (
-                contract.method_required or contract.required_components or body.rubric
+            if profile or (
+                cfg.boxed_judge_input == "box"
+                and not (contract.method_required or contract.required_components or body.rubric)
             ):
                 solution = box
         if cfg.max_answer_chars is not None and len(solution) > cfg.max_answer_chars:
             return finish("unresolved", "answer_exceeds_grading_limit")
         provenance["judged_candidate_sha256"] = hash_text(solution)
-        proven = deterministic_check(contract, solution, expected)
+        proven = deterministic_check(contract, solution, expected) if contract else None
+        if profile == "math":
+            try:
+                proven = await self._math_library.verify(expected, solution)
+            except (ImportError, OSError, TimeoutError) as error:
+                return finish("unresolved", "math_library_unavailable", evidence=type(error).__name__)
+            provenance["math_library_match"] = proven
+            # An equivalence match cannot establish obligations added by overrides.
+            extra_obligations = bool(
+                metadata.get("policy_overrides_applied")
+                or cfg.judge_domain_instructions.get(str(metadata.get("domain", "")))
+                or cfg.judge_source_instructions.get(str(metadata.get("source", "")))
+            )
+            if extra_obligations:
+                provenance["math_match_requires_judge"] = True
+                proven = None
         if proven is True:
-            provenance["route"] = contract.deterministic
-            return finish("correct", "deterministic_match")
+            provenance["route"] = "math_verify" if profile == "math" else contract.deterministic
+            return finish("correct", "math_verify_match" if profile == "math" else "deterministic_match")
         if not cfg.judge_model_revision or cfg.judge_model_server.name == "policy_model":
             return finish("unresolved", "fixed_judge_not_configured")
 
-        system = self._contract_template
+        system = self._shared_template if profile else self._contract_template
         if cfg.judge_system_message:
             system += "\n\n" + cfg.judge_system_message
+        if profile:
+            metadata = body.metadata or {}
+            for field, overrides in (
+                ("domain", cfg.judge_domain_instructions),
+                ("source", cfg.judge_source_instructions),
+            ):
+                instruction = overrides.get(str(metadata.get(field, "")))
+                if instruction:
+                    system += "\n\n" + instruction
         prompt = json.dumps(
             {
-                "contract": contract.model_dump(mode="json"),
+                **({"contract": contract.model_dump(mode="json")} if contract else {"grading_profile": profile}),
                 "question": question,
                 "policy_input": body.responses_create_params.model_dump(mode="json"),
                 "reference": expected,
@@ -656,7 +730,9 @@ class StemJudgeResourcesServer(SimpleResourcesServer):
             NeMoGymEasyInputMessage(role="user", content=prompt),
         ]
         provenance.update(
-            route="rubric_judge" if body.rubric else "semantic_judge",
+            route="math_verify_then_judge"
+            if profile == "math"
+            else ("rubric_judge" if body.rubric else "semantic_judge"),
             prompt_sha256=hash_text(system + "\n" + prompt),
             judge_request=params.model_dump(mode="json"),
             judge_max_attempts=cfg.judge_max_attempts,

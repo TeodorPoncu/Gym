@@ -598,7 +598,7 @@ class TestApp:
             )
             library_verifier.assert_awaited_once_with(
                 judge_equal_expected_answer,
-                judge_equal_generated_answer,
+                "\\boxed{" + exact_boxed_answer + "}",
             )
         assert judge_equal_reward == approx(1.0)
         assert judge_equal_extracted_answer == "math-verify extraction"

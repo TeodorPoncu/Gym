@@ -9,7 +9,7 @@ stem_contract:
         type: responses_api_models
         name: judge_model
       # Set an immutable checkpoint/API model revision before semantic grading.
-      judge_model_revision: null
+      judge_model_revision: ${oc.env:STEM_JUDGE_MODEL_REVISION,null}
       judge_responses_create_params:
         input: []
         temperature: 0

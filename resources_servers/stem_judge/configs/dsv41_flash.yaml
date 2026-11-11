@@ -1,8 +1,3 @@
-stem_contract:
-  resources_servers:
-    stem_judge:
-      judge_model_revision: ${oc.env:STEM_JUDGE_MODEL_REVISION}
-      verified: false
 judge_model:
   responses_api_models:
     vllm_model:

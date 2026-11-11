@@ -1,9 +1,11 @@
 # stem_judge resources server
 
-An opt-in [task-aware contract path](task-contracts.md) adds strict structured
-judgments, conservative deterministic checks, and explicit unresolved outcomes.
-Use `configs/stem_contract.yaml` for that path. The behavior documented below
-describes the preserved no-contract baseline.
+The [shared question-bank grading path](shared-grading.md) uses Math-Verify plus
+a judge for mathematics, and a semantic judge for other final-answer tasks.
+It selects the last boxed answer and supports domain/source instructions without
+requiring per-row contracts. Use `configs/question_bank.yaml` for that path.
+The earlier [optional contract mode](task-contracts.md) remains available. The
+behavior documented below describes the preserved no-contract baseline.
 
 LLM-as-judge rewards for STEM RL. It is built from Grigor Nalbandyan's
 `stem_v11` server and keeps its judge prompt (`prompt_templates/stem_v11.txt`, byte-identical) and

@@ -1,5 +1,9 @@
 # Task-aware grading
 
+The question-bank workflow now uses [shared grading profiles](shared-grading.md)
+and automatically prepared metadata. This document describes the optional
+explicit-contract mode; the dataset adapter no longer requires or consumes it.
+
 This opt-in implementation extends `jiachengx/stem-judge` at
 `78001c5ebc047d8d149f7bed74a5f9be5cb3b796`. The original YAML, prompts,
 parsers and no-contract scoring path remain available for fixed-answer baseline
@@ -71,10 +75,10 @@ full fixed-answer replay remain follow-up work.
 
 ## Preparation and validation
 
-`prepare.py` prepares membership, split and admission artifacts from the immutable
-question-bank format. It requires reviewed contracts before emitting gradable
-Gym rows. Its coverage report is an inventory, not an accuracy or training
-readiness claim. Keep the output and private data outside public source commits.
+`prepare.py` prepares membership, split and candidate evaluation artifacts from
+the immutable question-bank format using shared profiles. Its coverage report is
+an inventory, not an accuracy or training readiness claim. Keep the output and
+private data outside public source commits.
 Group source duplicates and original/repaired variants before tuning; reserve
 the supplied conflict families for development. Unknown semantic duplicates may
 still require manual family review.

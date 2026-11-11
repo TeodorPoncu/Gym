@@ -2,3 +2,5 @@
 # folder is installed as Gym/resources_servers/<name>/.
 -e nemo-gym[dev] @ ../../
 datasets==4.0.0
+# Same symbolic verifier used by resources_servers/math_with_judge.
+math-verify==0.8.0

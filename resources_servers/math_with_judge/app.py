@@ -46,6 +46,7 @@ from nemo_gym.server_runtime import (
 from nemo_gym.telemetry import MeteredSemaphore, resources_operation
 from nemo_gym.utils import is_nemo_gym_fastapi_entrypoint
 from nemo_gym.verification import call_judge, normalize_math_judge_verdict
+from resources_servers.math_with_judge.answer_extraction import extract_last_boxed_answer, has_boxed_command
 
 
 class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
@@ -87,22 +88,8 @@ class LibraryJudgeMathVerifyResponse(BaseVerifyResponse):
 
 
 def _extract_last_boxed_answer(response: str) -> Optional[str]:
-    r"""Extract the exact contents of the last complete ``\boxed{...}``."""
-    boxed_start = response.rfind("\\boxed{")
-    if boxed_start < 0:
-        return None
-
-    content_start = boxed_start + len("\\boxed{")
-    brace_depth = 1
-    for index in range(content_start, len(response)):
-        if response[index] == "{":
-            brace_depth += 1
-        elif response[index] == "}":
-            brace_depth -= 1
-            if brace_depth == 0:
-                return response[content_start:index]
-
-    return None
+    r"""Extract the final box, without recovering an earlier answer on failure."""
+    return extract_last_boxed_answer(response)
 
 
 _ANSWER_LABELS = (
@@ -472,7 +459,11 @@ Example output: "My final verdict is different [[A!=B]]"."""
             verification_response = _prepare_format_tolerant_response(generated_answer)
 
         answer_candidate = _extract_last_boxed_answer(verification_response)
-        if answer_candidate is None and self.config.format_tolerant_answer_extraction:
+        if answer_candidate is not None:
+            # math-verify may parse several candidates from a full response.
+            # Give the library exactly the same final box shown to the judge.
+            verification_response = "\\boxed{" + answer_candidate + "}"
+        elif self.config.format_tolerant_answer_extraction and not has_boxed_command(verification_response):
             answer_candidate = _extract_unboxed_answer_candidate(verification_response)
             # Grade only the selected final answer. Parsing the full response can
             # award credit for a conflicting intermediate number or earlier label.
