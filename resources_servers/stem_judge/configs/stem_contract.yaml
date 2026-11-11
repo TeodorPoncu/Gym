@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+stem_contract:
+  resources_servers:
+    stem_judge:
+      entrypoint: app.py
+      require_task_contract: true
+      judge_model_server:
+        type: responses_api_models
+        name: judge_model
+      # Set an immutable checkpoint/API model revision before semantic grading.
+      judge_model_revision: null
+      judge_responses_create_params:
+        input: []
+        temperature: 0
+        max_output_tokens: 8192
+      judge_endpoint_max_concurrency: 8
+      judge_timeout_seconds: 300
+      judge_max_attempts: 2
+      default_answer_format: free
+      boxed_judge_input: final_answer
+      max_answer_chars: 16000
+      rubric_reward: fraction
+      domain: knowledge
+      verified: false
+      description: Explicit task contracts with structured judgments and unresolved grading outcomes
+      value: Separate valid task scores from unavailable verification
+stem_contract_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: stem_contract
+      model_server:
+        type: responses_api_models
+        name: policy_model

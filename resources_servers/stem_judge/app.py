@@ -1,5 +1,10 @@
 """stem_judge resources server.
 
+Rows with ``task_contract`` (or ``require_task_contract`` configured) use strict
+structured verdicts and explicit unresolved outcomes. The contract path checks
+completion, binds provenance, and separates rubric credit from binary success.
+The following describes the preserved baseline path for rows without contracts.
+
 LLM-as-judge rewards for STEM RL. Built from Grigor Nalbandyan's ``stem_v11``
 server: the same judge prompt and verdict parser, with the inherited
 ``equivalence_llm_judge`` machinery (A/B swap, full-generation rescue,
@@ -50,12 +55,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Literal, Optional
 
+from aiohttp import ClientTimeout
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # The pre-reorganization import paths: the Gym checkouts the STEM RL runs use
@@ -74,6 +82,15 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseCreateParamsNonStreaming,
 )
 from nemo_gym.server_utils import get_response_json
+from nemo_gym.verification import (
+    JUDGE_FAILURES,
+    JudgeError,
+    call_judge,
+    is_judge_failure,
+    judge_failsafe,
+    record_parsed_judge_verdict,
+)
+from resources_servers.stem_judge.contracts import TaskContract, deterministic_check, hash_text, parse_judgment
 
 
 # Same as stem_v11: strips the fixed instruction preamble that ends with the
@@ -101,7 +118,7 @@ class StemJudgeConfig(BaseResourcesServerConfig):
     judge_model_server: ModelServerRef
     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
     # Concurrency limit for judge requests. None disables limiting.
-    judge_endpoint_max_concurrency: Optional[int] = 64
+    judge_endpoint_max_concurrency: Optional[int] = Field(default=64, gt=0)
     judge_system_message: Optional[str] = None
     # Placeholders: {question}, {expected_answer}, {generated_answer}.
     answer_prompt_template_fpath: str = "prompt_templates/stem_v11.txt"
@@ -112,6 +129,13 @@ class StemJudgeConfig(BaseResourcesServerConfig):
     # question_extract_regex wins over extract_problem_from_prompt.
     question_extract_regex: Optional[str] = None
     extract_problem_from_prompt: bool = False
+
+    # Contract grading is opt-in; the original prompt/parser remain reproducible.
+    require_task_contract: bool = False
+    judge_model_revision: Optional[str] = None
+    judge_timeout_seconds: float = Field(default=300.0, gt=0, le=300, allow_inf_nan=False)
+    judge_max_attempts: int = Field(default=2, ge=1, le=2)
+    contract_prompt_template_fpath: str = str(Path(__file__).parent / "prompt_templates/stem_contract_v1.txt")
 
     # --- Answer contract. A row's own answer_format wins. ---
     default_answer_format: Literal["boxed", "free"] = "boxed"
@@ -147,14 +171,15 @@ class RubricCriterion(BaseModel):
 
     @model_validator(mode="after")
     def _points_nonzero(self) -> RubricCriterion:
-        if self.points == 0:
-            raise ValueError(f"rubric criterion {self.id!r} has 0 points")
+        if not math.isfinite(self.points) or self.points == 0:
+            raise ValueError(f"rubric criterion {self.id!r} must have finite nonzero points")
         return self
 
 
 class StemJudgeRunRequest(BaseRunRequest):
     model_config = ConfigDict(extra="allow")
 
+    task_contract: Optional[TaskContract] = None
     uuid: Optional[str | int] = None
     expected_answer: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
@@ -170,6 +195,8 @@ class StemJudgeRunRequest(BaseRunRequest):
         ids = [c.id for c in self.rubric]
         if len(set(ids)) != len(ids):
             raise ValueError(f"rubric criterion ids are not unique: {ids}")
+        if not math.isfinite(sum(abs(c.points) for c in self.rubric)):
+            raise ValueError("rubric absolute point total must be finite")
         if not any(c.points > 0 for c in self.rubric):
             raise ValueError("rubric has no criterion with positive points")
         return self
@@ -189,6 +216,8 @@ class JudgeEvaluation(BaseModel):
 
 
 class StemJudgeVerifyResponse(BaseVerifyResponse):
+    model_config = ConfigDict(extra="allow")
+
     expected_answer: str
     answer_format: str
     # "judged", "judge_unparsed", or why the judge was not called.
@@ -196,6 +225,11 @@ class StemJudgeVerifyResponse(BaseVerifyResponse):
     # Rubric rows only: earned / total positive points, before rubric_reward.
     rubric_score: Optional[float] = None
     judge_evaluations: list[JudgeEvaluation]
+    # Only contract grading sets these; None identifies the unchanged baseline.
+    verdict: Optional[Literal["correct", "incorrect", "unresolved"]] = None
+    correctness: Optional[bool] = None
+    evaluation_completed: Optional[bool] = None
+    grading_provenance: Optional[dict[str, Any]] = None
 
 
 def _assistant_text(response: NeMoGymResponse) -> str:
@@ -209,6 +243,20 @@ def _assistant_text(response: NeMoGymResponse) -> str:
                 return "\n".join(t for t in (getattr(c, "text", None) for c in content) if isinstance(t, str))
             return ""
     return ""
+
+
+def _response_completed(response: NeMoGymResponse) -> bool:
+    """Require explicit completion of the response and all assistant messages."""
+    return (
+        response.status == "completed"
+        and response.incomplete_details is None
+        and response.error is None
+        and all(
+            getattr(item, "status", None) == "completed"
+            for item in response.output
+            if getattr(item, "type", None) == "message"
+        )
+    )
 
 
 def _is_length_truncated(response: NeMoGymResponse) -> bool:
@@ -362,6 +410,8 @@ class StemJudgeResourcesServer(SimpleResourcesServer):
             self._answer_template = f.read().strip()
         with open(self.config.rubric_prompt_template_fpath) as f:
             self._rubric_template = f.read().strip()
+        with open(self.config.contract_prompt_template_fpath) as f:
+            self._contract_template = f.read().strip()
 
         # The pid suffix keeps server replicas from sharing one file; appends within
         # one process are serialized by the event loop (no await between open and close).
@@ -382,6 +432,8 @@ class StemJudgeResourcesServer(SimpleResourcesServer):
         return PROBLEM_EXTRACT_REGEX if self.config.extract_problem_from_prompt else None
 
     async def verify(self, body: StemJudgeVerifyRequest) -> StemJudgeVerifyResponse:
+        if body.task_contract is not None or self.config.require_task_contract:
+            return await self._verify_contract(body)
         cfg = self.config
         expected = str(body.expected_answer or (body.metadata or {}).get("expected_answer") or "")
         answer_format = body.answer_format or cfg.default_answer_format
@@ -410,6 +462,247 @@ class StemJudgeResourcesServer(SimpleResourcesServer):
         if body.rubric:
             return await self._grade_rubric(body, expected, answer_format, question, solution)
         return await self._grade_answer(body, expected, answer_format, question, solution)
+
+    async def _verify_contract(self, body: StemJudgeVerifyRequest) -> StemJudgeVerifyResponse:
+        """Grade only declared obligations, preserving unusable measurements as unresolved."""
+        started = time.monotonic()
+        cfg, contract = self.config, body.task_contract
+        expected = body.expected_answer or ""
+        raw_final = _assistant_text(body.response)
+        final = raw_final.strip()
+        answer_format = contract.answer_format if contract else "free"
+        evaluations: list[JudgeEvaluation] = []
+        provenance: dict[str, Any] = {
+            "verifier_revision": "stem-contract-v1",
+            "grading_config_sha256": hash_text(cfg.model_dump_json()),
+            "contract_sha256": hash_text(contract.model_dump_json()) if contract else None,
+            "rubric_sha256": hash_text(
+                json.dumps([c.model_dump() for c in body.rubric] if body.rubric else None, sort_keys=True)
+            ),
+            "grading_config": {
+                "max_box_chars": cfg.max_box_chars,
+                "max_answer_chars": cfg.max_answer_chars,
+                "boxed_judge_input": cfg.boxed_judge_input,
+                "rubric_reward": cfg.rubric_reward,
+                "require_task_contract": cfg.require_task_contract,
+            },
+            "contract": contract.model_dump(mode="json") if contract else None,
+            "candidate_sha256": hash_text(raw_final),
+            "reference_sha256": hash_text(expected),
+            "policy_input": body.responses_create_params.model_dump(mode="json"),
+            "judge_model_server": cfg.judge_model_server.name,
+            "judge_model_revision": cfg.judge_model_revision,
+            "route": "validation",
+        }
+
+        def finish(
+            verdict: Literal["correct", "incorrect", "unresolved"],
+            reason: str,
+            *,
+            evidence: str = "",
+            score: Optional[float] = None,
+            failure_fields: Optional[dict[str, Any]] = None,
+        ) -> StemJudgeVerifyResponse:
+            unresolved = verdict == "unresolved"
+            correct = None if unresolved else verdict == "correct"
+            reward = (
+                0.0
+                if unresolved
+                else (score if score is not None and cfg.rubric_reward == "fraction" else float(correct))
+            )
+            provenance.update(reason_code=reason, evidence=evidence, elapsed_seconds=time.monotonic() - started)
+            payload = body.model_dump()
+            for key in (
+                "_ng_failure_class",
+                "_ng_failure_judge_error",
+                "failure_kind",
+                "failure_reason",
+                "failure_outcome_action",
+                "failure_outcome_attribution",
+            ):
+                payload.pop(key, None)
+            if isinstance(payload.get("instance_config"), dict):
+                payload["instance_config"] = {
+                    key: value for key, value in payload["instance_config"].items() if key != "mask_sample"
+                }
+            if failure_fields:
+                payload.update(failure_fields)
+            instance_config = payload.get("instance_config")
+            payload.update(
+                expected_answer=expected,
+                answer_format=answer_format,
+                grading_status=reason,
+                reward=reward,
+                rubric_score=score,
+                judge_evaluations=evaluations,
+                verdict=verdict,
+                correctness=correct,
+                evaluation_completed=not unresolved,
+                mask_sample=unresolved,
+                failure_kind=payload.get("failure_kind") or ("stem_judge:unresolved" if unresolved else None),
+                failure_reason=(evidence or reason) if unresolved else None,
+                grading_provenance=provenance,
+            )
+            if unresolved:
+                # Older NRL consumers read the nested flag; the file collector uses the sidecar marker.
+                payload["instance_config"] = {
+                    **(instance_config if isinstance(instance_config, dict) else {}),
+                    "mask_sample": True,
+                }
+                payload["_ng_failure_class"] = "judge_failed"
+            result = StemJudgeVerifyResponse.model_validate(payload)
+            if self._gen_log_path:
+                with open(self._gen_log_path, "a") as stream:
+                    stream.write(result.model_dump_json() + "\n")
+            return result
+
+        async def judge_failure(error: Exception, reason: str) -> StemJudgeVerifyResponse:
+            # Reuse Gym's failure-report and sidecar transport, then add the contract outcome.
+            @judge_failsafe
+            async def failed(body: StemJudgeVerifyRequest) -> None:
+                raise error
+
+            response = await failed(body)
+            return finish("unresolved", reason, evidence=str(error), failure_fields=json.loads(response.body))
+
+        if contract is None:
+            return finish("unresolved", "missing_task_contract")
+        if body.uuid is not None and str(body.uuid) != contract.task_id:
+            return finish("unresolved", "task_id_mismatch")
+        if body.answer_format is not None and body.answer_format != contract.answer_format:
+            return finish("unresolved", "conflicting_answer_format")
+        if contract.task_type == "native":
+            return finish("unresolved", "native_runner_unavailable")
+        if contract.repaired and (not contract.assets_verified or not contract.reference_sha256):
+            return finish("unresolved", "repaired_assets_unverified")
+        if contract.task_type == "answer" and not expected.strip():
+            return finish("unresolved", "missing_reference")
+        if contract.task_type == "answer" and contract.reference_sha256 is None:
+            return finish("unresolved", "missing_reference_hash")
+        if contract.reference_sha256 is not None and contract.reference_sha256 != hash_text(expected):
+            return finish("unresolved", "reference_hash_mismatch")
+        if (contract.task_type == "rubric") != bool(body.rubric):
+            return finish("unresolved", "rubric_contract_mismatch")
+        if body.rubric:
+            positive_ids = {c.id for c in body.rubric if c.points > 0}
+            if not set(contract.mandatory_criteria).issubset(positive_ids):
+                return finish("unresolved", "invalid_mandatory_criteria")
+
+        question = ""
+        for message in body.responses_create_params.input or []:
+            if getattr(message, "role", None) != "user":
+                continue
+            content = getattr(message, "content", None)
+            if isinstance(content, str):
+                question = content.strip()
+            elif isinstance(content, list) and all(
+                (block.get("type") if isinstance(block, dict) else getattr(block, "type", None)) == "input_text"
+                for block in content
+            ):
+                question = "\n".join(
+                    block["text"] if isinstance(block, dict) else block.text for block in content
+                ).strip()
+            else:
+                return finish("unresolved", "unsupported_question_content")
+        provenance["question_sha256"] = hash_text(question)
+        if not question:
+            return finish("unresolved", "missing_question")
+        if _is_length_truncated(body.response):
+            return finish("incorrect", "policy_truncated")
+        if not _response_completed(body.response):
+            return finish("unresolved", "policy_incomplete")
+        if not final:
+            return finish("incorrect", "empty_final_answer")
+        solution = final
+        if answer_format == "boxed":
+            box = last_boxed(final)
+            if box is None:
+                return finish("incorrect", "no_boxed")
+            if cfg.max_box_chars is not None and len(box) > cfg.max_box_chars:
+                return finish("unresolved", "box_exceeds_grading_limit")
+            # Required work must remain visible even when the final value is boxed.
+            if cfg.boxed_judge_input == "box" and not (
+                contract.method_required or contract.required_components or body.rubric
+            ):
+                solution = box
+        if cfg.max_answer_chars is not None and len(solution) > cfg.max_answer_chars:
+            return finish("unresolved", "answer_exceeds_grading_limit")
+        provenance["judged_candidate_sha256"] = hash_text(solution)
+        proven = deterministic_check(contract, solution, expected)
+        if proven is True:
+            provenance["route"] = contract.deterministic
+            return finish("correct", "deterministic_match")
+        if not cfg.judge_model_revision or cfg.judge_model_server.name == "policy_model":
+            return finish("unresolved", "fixed_judge_not_configured")
+
+        system = self._contract_template
+        if cfg.judge_system_message:
+            system += "\n\n" + cfg.judge_system_message
+        prompt = json.dumps(
+            {
+                "contract": contract.model_dump(mode="json"),
+                "question": question,
+                "policy_input": body.responses_create_params.model_dump(mode="json"),
+                "reference": expected,
+                "rubric": [criterion.model_dump() for criterion in body.rubric] if body.rubric else None,
+                "candidate": solution,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        params = cfg.judge_responses_create_params.model_copy(deep=True)
+        params.input = [
+            NeMoGymEasyInputMessage(role="system", content=system),
+            NeMoGymEasyInputMessage(role="user", content=prompt),
+        ]
+        provenance.update(
+            route="rubric_judge" if body.rubric else "semantic_judge",
+            prompt_sha256=hash_text(system + "\n" + prompt),
+            judge_request=params.model_dump(mode="json"),
+            judge_max_attempts=cfg.judge_max_attempts,
+            judge_timeout_seconds=cfg.judge_timeout_seconds,
+        )
+        try:
+            async with self._judge_endpoint_max_concurrency:
+                response = await call_judge(
+                    self.server_client,
+                    server_name=cfg.judge_model_server.name,
+                    url_path="/v1/responses",
+                    json=params,
+                    response_model=NeMoGymResponse,
+                    timeout=ClientTimeout(total=cfg.judge_timeout_seconds),
+                    max_attempts=cfg.judge_max_attempts,
+                )
+        except JUDGE_FAILURES as error:
+            if not is_judge_failure(error):
+                raise
+            return await judge_failure(error, "judge_transport_failed")
+        evaluation = JudgeEvaluation(responses_create_params=params, response=response)
+        evaluations.append(evaluation)
+        if not _response_completed(response):
+            return await judge_failure(JudgeError("Judge response did not complete"), "judge_incomplete")
+        judge_messages = [item for item in response.output if getattr(item, "role", None) == "assistant"]
+        if len(judge_messages) != 1:
+            return await judge_failure(JudgeError("Expected one complete judgment message"), "judge_unparsed")
+        judgment = parse_judgment(_assistant_text(response), [c.id for c in body.rubric] if body.rubric else None)
+        if judgment is None:
+            return await judge_failure(JudgeError("Judge output violated the strict verdict schema"), "judge_unparsed")
+        evaluation.verdict_label = judgment.verdict
+        evaluation.criteria_met = judgment.criteria_met
+        if judgment.verdict == "unresolved":
+            return await judge_failure(JudgeError(judgment.reason_code + ": " + judgment.evidence), "judge_unresolved")
+        score = None
+        if body.rubric:
+            score = rubric_fraction(body.rubric, judgment.criteria_met)
+            correct = score >= contract.rubric_pass_fraction and all(
+                judgment.criteria_met[criterion_id] for criterion_id in contract.mandatory_criteria
+            )
+            if correct != (judgment.verdict == "correct"):
+                return await judge_failure(
+                    JudgeError("Verdict contradicts rubric pass predicate"), "judge_conflicting"
+                )
+        record_parsed_judge_verdict()
+        return finish(judgment.verdict, judgment.reason_code, evidence=judgment.evidence, score=score)
 
     async def _grade_answer(
         self, body: StemJudgeVerifyRequest, expected: str, answer_format: str, question: str, solution: str
