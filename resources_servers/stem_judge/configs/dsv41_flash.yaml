@@ -9,7 +9,7 @@ judge_model:
       entrypoint: app.py
       base_url: ${oc.env:STEM_JUDGE_BASE_URL}
       api_key: ${oc.env:STEM_JUDGE_API_KEY}
-      model: private/nemotron/deepseek-ai/deepseek-v4_1-flash
+      model: ${oc.env:STEM_JUDGE_MODEL,private/nemotron/deepseek-ai/deepseek-v4_1-flash}
       return_token_id_information: false
       uses_reasoning_parser: true
       max_num_tries: 1

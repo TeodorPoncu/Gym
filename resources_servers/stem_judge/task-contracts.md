@@ -13,6 +13,11 @@ the contract configuration. Supply `STEM_JUDGE_BASE_URL`, `STEM_JUDGE_API_KEY`,
 and `STEM_JUDGE_MODEL_REVISION` through the process environment. The revision
 must come from the service's deployment identity; its routing alias alone is
 not an immutable weight revision. Credentials are never checked into the branch.
+For a different gateway such as NVIDIA Inference Hub, set `STEM_JUDGE_MODEL` to
+the DSV4.1 Flash identifier advertised by that endpoint's authenticated model
+catalog. The default is the private NVCF alias; aliases are not interchangeable
+across gateways. Endpoint access and the actual returned model identity still
+need live verification.
 
 ## Contract boundary
 
