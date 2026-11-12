@@ -144,7 +144,8 @@ class StemJudgeConfig(BaseResourcesServerConfig):
     judge_source_instructions: dict[str, str] = Field(default_factory=dict)
     shared_prompt_template_fpath: str = str(Path(__file__).parent / "prompt_templates/shared_answer_v1.txt")
     judge_model_revision: Optional[str] = None
-    judge_timeout_seconds: float = Field(default=300.0, gt=0, le=300, allow_inf_nan=False)
+    # None preserves the model server's deadline policy for long judge responses.
+    judge_timeout_seconds: Optional[float] = Field(default=300.0, gt=0, le=300, allow_inf_nan=False)
     judge_max_attempts: int = Field(default=2, ge=1, le=2)
     contract_prompt_template_fpath: str = str(Path(__file__).parent / "prompt_templates/stem_contract_v1.txt")
 

@@ -239,6 +239,12 @@ def test_nonpositive_concurrency_is_rejected():
         server(judge_endpoint_max_concurrency=0)
 
 
+@mark.parametrize("timeout", [0, -1, 301, float("nan"), float("inf"), -float("inf")])
+def test_invalid_judge_timeout_is_rejected(timeout: float) -> None:
+    with raises(ValidationError):
+        server(judge_timeout_seconds=timeout)
+
+
 @mark.asyncio
 async def test_conflicting_judgment_messages_are_unresolved(monkeypatch):
     _, response = judge(monkeypatch)

@@ -35,6 +35,13 @@ Unresolved grades carry `mask_sample: true`, `evaluation_completed: false`,
 that a particular NeMoRL version excludes failures from all losses and group
 statistics; that integration still requires a real rollout/training test.
 
+`judge_timeout_seconds` defaults to 300 seconds per HTTP attempt. Set it to
+`null` to remove the resource server's deadline when the judge's serving policy
+must govern long responses. Numeric timeouts must remain positive, finite, and
+at most 300 seconds. `judge_endpoint_max_concurrency: null` separately disables
+the resource's judge-call semaphore. Neither setting changes completion checks
+or exclusion of unresolved judgments.
+
 ## Generation and grading instructions
 
 The dataset adapter adds this exact instruction once:

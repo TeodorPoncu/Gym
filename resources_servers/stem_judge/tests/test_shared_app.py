@@ -4,12 +4,12 @@
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from pytest import mark
 
 from resources_servers.stem_judge.contracts import hash_text
-from resources_servers.stem_judge.tests.test_app import _request, _split
+from resources_servers.stem_judge.tests.test_app import _msg, _request, _response, _split
 from resources_servers.stem_judge.tests.test_contract_app import contract, judge, server
 
 
@@ -39,6 +39,40 @@ async def test_semantic_profile_accepts_row_without_per_row_contract(monkeypatch
     assert result.verdict == "correct" and result.correctness is True
     assert result.evaluation_completed and not result.mask_sample
     call.assert_awaited_once()
+
+
+@mark.asyncio
+@mark.parametrize("status, excluded", [("completed", False), ("incomplete", True)])
+async def test_disabled_judge_deadline_preserves_transport_and_outcome(status: str, excluded: bool) -> None:
+    resource = server(
+        grading_profile="semantic",
+        judge_endpoint_max_concurrency=None,
+        judge_timeout_seconds=None,
+        judge_max_attempts=1,
+        judge_responses_create_params={"input": [], "max_output_tokens": 65536},
+    )
+    response = _response(_msg(json.dumps({"verdict": "correct", "reason_code": "equal", "evidence": "Same value."})))
+    response.status = status
+    http_response = MagicMock(ok=True, status=200)
+    http_response.read = AsyncMock(return_value=response.model_dump_json().encode())
+    resource.server_client.post = AsyncMock(return_value=http_response)
+
+    result = await resource.verify(shared_request())
+
+    resource.server_client.post.assert_awaited_once()
+    request_kwargs = resource.server_client.post.await_args.kwargs
+    assert request_kwargs["timeout"].total is None
+    assert request_kwargs["json"].max_output_tokens == 65536
+    assert result.grading_provenance["judge_timeout_seconds"] is None
+    assert result.mask_sample is excluded
+    assert result.evaluation_completed is not excluded
+    if excluded:
+        assert result.verdict == "unresolved" and result.correctness is None
+        assert result.grading_status == "judge_incomplete"
+        assert result.failure_kind == "judge_failed"
+    else:
+        assert result.verdict == "correct" and result.correctness is True
+        assert result.reward == 1
 
 
 @mark.asyncio
